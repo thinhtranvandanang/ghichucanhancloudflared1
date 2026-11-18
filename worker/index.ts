@@ -1,0 +1,384 @@
+import { Hono } from 'hono';
+import { getCookie } from 'hono/cookie';
+import {
+  honoSimpleGoogleAuth,
+  type GoogleAuthEnv,
+} from 'hono-simple-google-auth';
+import type { D1Database, Fetcher } from '@cloudflare/workers-types';
+import { VietnameseSignInPage } from './signInPage';
+
+interface ValidSessionData {
+  signedIn: true;
+  sessionId: string;
+  name: string;
+  email: string;
+  credential: string;
+}
+
+export type WorkerBindings = {
+  DB: D1Database;
+  ASSETS: Fetcher;
+  GOOGLE_CLIENT_ID: string;
+  GOOGLE_CLIENT_SECRET: string;
+  AUTH_SECRET: string;
+  AUTH_MODE?: 'livemode' | 'testmode';
+};
+
+type AppEnv = GoogleAuthEnv & {
+  Bindings: WorkerBindings;
+};
+
+interface NoteRow {
+  id: number;
+  user_email: string;
+  title: string;
+  content: string;
+  created_at: string;
+}
+
+interface SessionRow {
+  session_id: string;
+  email: string;
+  name: string;
+  credential: string;
+  created_at: string;
+  expires_at: number;
+}
+
+const SESSION_COOKIE_NAME = 'sotay_session';
+const SESSION_TTL_SECONDS = 60 * 60 * 24 * 30; // 30 ngày
+
+/**
+ * Tạo mã băm HMAC-SHA256 từ sessionId và AUTH_SECRET để không lưu sessionId gốc trong D1.
+ */
+async function hashSessionId(sessionId: string, secret: string): Promise<string> {
+  const encoder = new TextEncoder();
+  const key = await crypto.subtle.importKey(
+    'raw',
+    encoder.encode(secret || 'fallback-dev-secret-change-me'),
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['sign']
+  );
+  const signature = await crypto.subtle.sign('HMAC', key, encoder.encode(sessionId));
+  return Array.from(new Uint8Array(signature))
+    .map((b) => b.toString(16).padStart(2, '0'))
+    .join('');
+}
+
+/**
+ * Tạo SessionStore lưu trữ phiên đăng nhập vào Cloudflare D1 (không cần KV).
+ */
+function createD1SessionStore(db: D1Database, authSecret: string) {
+  return {
+    async get(sessionId: string): Promise<ValidSessionData | undefined> {
+      const hashedId = await hashSessionId(sessionId, authSecret);
+      const now = Math.floor(Date.now() / 1000);
+
+      const row = await db
+        .prepare(
+          'SELECT session_id, email, name, credential, expires_at FROM sessions WHERE session_id = ?'
+        )
+        .bind(hashedId)
+        .first<SessionRow>();
+
+      if (!row) return undefined;
+
+      if (row.expires_at <= now) {
+        await db.prepare('DELETE FROM sessions WHERE session_id = ?').bind(hashedId).run();
+        return undefined;
+      }
+
+      return {
+        signedIn: true,
+        sessionId,
+        email: row.email,
+        name: row.name,
+        credential: row.credential,
+      };
+    },
+
+    async put(data: ValidSessionData): Promise<void> {
+      const hashedId = await hashSessionId(data.sessionId, authSecret);
+      const nowIso = new Date().toISOString();
+      const expiresAt = Math.floor(Date.now() / 1000) + SESSION_TTL_SECONDS;
+
+      await db
+        .prepare(
+          `INSERT INTO sessions (session_id, email, name, credential, created_at, expires_at)
+           VALUES (?, ?, ?, ?, ?, ?)
+           ON CONFLICT(session_id) DO UPDATE SET
+             email = excluded.email,
+             name = excluded.name,
+             credential = excluded.credential,
+             expires_at = excluded.expires_at`
+        )
+        .bind(hashedId, data.email, data.name || data.email, data.credential || '', nowIso, expiresAt)
+        .run();
+    },
+
+    async delete(sessionId: string): Promise<void> {
+      const hashedId = await hashSessionId(sessionId, authSecret);
+      await db.prepare('DELETE FROM sessions WHERE session_id = ?').bind(hashedId).run();
+    },
+  };
+}
+
+const app = new Hono<AppEnv>();
+
+const googleAuth = honoSimpleGoogleAuth<AppEnv>(async (c) => {
+  const url = new URL(c.req.url);
+  const callbackUrl = `${url.protocol}//${url.host}/auth/callback`;
+  const mode = c.env.AUTH_MODE === 'testmode' ? 'testmode' : 'livemode';
+
+  return {
+    clientId: c.env.GOOGLE_CLIENT_ID || '',
+    callbackUrl,
+    cookieName: SESSION_COOKIE_NAME,
+    sessionDurationSeconds: SESSION_TTL_SECONDS,
+    sessionStore: createD1SessionStore(c.env.DB, c.env.AUTH_SECRET),
+    mode,
+    renderSignInPage: VietnameseSignInPage,
+  };
+});
+
+// Middleware bảo mật cookie: đảm bảo HttpOnly, SameSite=Lax và Secure (trên HTTPS)
+app.use('/auth/*', async (c, next) => {
+  const url = new URL(c.req.url);
+
+  // Khi đăng xuất, xóa bản ghi session trong D1 trước khi thư viện xóa cookie
+  if (url.pathname === '/auth/signout') {
+    const sessionId = getCookie(c, SESSION_COOKIE_NAME);
+    if (sessionId) {
+      const hashedId = await hashSessionId(sessionId, c.env.AUTH_SECRET);
+      await c.env.DB.prepare('DELETE FROM sessions WHERE session_id = ?').bind(hashedId).run();
+    }
+  }
+
+  await next();
+
+  const setCookieHeader = c.res.headers.get('Set-Cookie');
+  if (setCookieHeader && url.protocol === 'https:' && !/\bSecure\b/i.test(setCookieHeader)) {
+    c.res.headers.set('Set-Cookie', `${setCookieHeader}; Secure`);
+  }
+});
+
+// Gắn các route xác thực: /auth/signin, /auth/callback, /auth/signout
+app.route('/auth', googleAuth.routes);
+
+// Gắn session middleware cho toàn bộ API
+app.use('/api/*', googleAuth.session);
+
+// Kiểm tra trạng thái đăng nhập hiện tại
+app.get('/api/me', async (c) => {
+  const session = c.var.session;
+  const mode = c.env.AUTH_MODE === 'testmode' ? 'testmode' : 'livemode';
+  const url = new URL(c.req.url);
+  const loginUri = `${url.protocol}//${url.host}/auth/callback`;
+
+  if (!session?.signedIn || !session.email) {
+    return c.json({
+      authenticated: false,
+      mode,
+      clientId: c.env.GOOGLE_CLIENT_ID || '',
+      loginUri,
+    });
+  }
+
+  return c.json({
+    authenticated: true,
+    mode,
+    clientId: c.env.GOOGLE_CLIENT_ID || '',
+    loginUri,
+    user: {
+      email: session.email,
+      name: session.name || session.email,
+    },
+  });
+});
+
+// Middleware bắt buộc đăng nhập cho mọi thao tác ghi chú
+app.use('/api/notes*', async (c, next) => {
+  const session = c.var.session;
+  if (!session?.signedIn || !session.email) {
+    return c.json({ error: 'Phiên đăng nhập đã hết hạn. Vui lòng đăng nhập lại bằng Gmail.' }, 401);
+  }
+  await next();
+});
+
+// Lấy danh sách ghi chú của người dùng (mới nhất lên đầu) + tìm kiếm theo từ khóa
+app.get('/api/notes', async (c) => {
+  const session = c.var.session;
+  if (!session?.signedIn) {
+    return c.json({ error: 'Chưa đăng nhập.' }, 401);
+  }
+
+  const query = (c.req.query('q') || '').trim();
+
+  try {
+    const result = await c.env.DB.prepare(
+      `SELECT id, user_email, title, content, created_at
+       FROM notes
+       WHERE user_email = ?
+       ORDER BY created_at DESC, id DESC`
+    )
+      .bind(session.email)
+      .all<NoteRow>();
+
+    let notes = result.results || [];
+
+    if (query.length > 0) {
+      const keyword = query.toLocaleLowerCase('vi-VN');
+      notes = notes.filter((note) => {
+        const titleLower = note.title.toLocaleLowerCase('vi-VN');
+        const contentLower = note.content.toLocaleLowerCase('vi-VN');
+        return titleLower.includes(keyword) || contentLower.includes(keyword);
+      });
+    }
+
+    return c.json({ notes });
+  } catch (err) {
+    console.error('Lỗi đọc ghi chú D1:', err);
+    return c.json({ error: 'Không thể tải danh sách ghi chú. Vui lòng thử lại.' }, 500);
+  }
+});
+
+// Tạo ghi chú mới (created_at do server tự sinh theo chuẩn ISO 8601)
+app.post('/api/notes', async (c) => {
+  const session = c.var.session;
+  if (!session?.signedIn) {
+    return c.json({ error: 'Chưa đăng nhập.' }, 401);
+  }
+
+  let body: { title?: unknown; content?: unknown };
+  try {
+    body = await c.req.json();
+  } catch {
+    return c.json({ error: 'Dữ liệu gửi lên không hợp lệ.' }, 400);
+  }
+
+  const title = typeof body.title === 'string' ? body.title.trim() : '';
+  const content = typeof body.content === 'string' ? body.content.trim() : '';
+
+  if (!title) {
+    return c.json({ error: 'Vui lòng nhập tiêu đề ghi chú.' }, 400);
+  }
+  if (!content) {
+    return c.json({ error: 'Vui lòng nhập nội dung ghi chú.' }, 400);
+  }
+  if (title.length > 200) {
+    return c.json({ error: 'Tiêu đề tối đa 200 ký tự.' }, 400);
+  }
+
+  const createdAt = new Date().toISOString();
+
+  try {
+    const inserted = await c.env.DB.prepare(
+      `INSERT INTO notes (user_email, title, content, created_at)
+       VALUES (?, ?, ?, ?)
+       RETURNING id, user_email, title, content, created_at`
+    )
+      .bind(session.email, title, content, createdAt)
+      .first<NoteRow>();
+
+    return c.json({ note: inserted }, 201);
+  } catch (err) {
+    console.error('Lỗi tạo ghi chú D1:', err);
+    return c.json({ error: 'Không thể lưu ghi chú. Vui lòng thử lại.' }, 500);
+  }
+});
+
+// Cập nhật ghi chú của chính người dùng
+app.put('/api/notes/:id', async (c) => {
+  const session = c.var.session;
+  if (!session?.signedIn) {
+    return c.json({ error: 'Chưa đăng nhập.' }, 401);
+  }
+
+  const id = Number(c.req.param('id'));
+  if (!Number.isInteger(id) || id <= 0) {
+    return c.json({ error: 'Mã ghi chú không hợp lệ.' }, 400);
+  }
+
+  let body: { title?: unknown; content?: unknown };
+  try {
+    body = await c.req.json();
+  } catch {
+    return c.json({ error: 'Dữ liệu gửi lên không hợp lệ.' }, 400);
+  }
+
+  const title = typeof body.title === 'string' ? body.title.trim() : '';
+  const content = typeof body.content === 'string' ? body.content.trim() : '';
+
+  if (!title) {
+    return c.json({ error: 'Vui lòng nhập tiêu đề ghi chú.' }, 400);
+  }
+  if (!content) {
+    return c.json({ error: 'Vui lòng nhập nội dung ghi chú.' }, 400);
+  }
+  if (title.length > 200) {
+    return c.json({ error: 'Tiêu đề tối đa 200 ký tự.' }, 400);
+  }
+
+  try {
+    const updated = await c.env.DB.prepare(
+      `UPDATE notes
+       SET title = ?, content = ?
+       WHERE id = ? AND user_email = ?
+       RETURNING id, user_email, title, content, created_at`
+    )
+      .bind(title, content, id, session.email)
+      .first<NoteRow>();
+
+    if (!updated) {
+      return c.json({ error: 'Không tìm thấy ghi chú hoặc bạn không có quyền sửa.' }, 404);
+    }
+
+    return c.json({ note: updated });
+  } catch (err) {
+    console.error('Lỗi cập nhật ghi chú D1:', err);
+    return c.json({ error: 'Không thể cập nhật ghi chú. Vui lòng thử lại.' }, 500);
+  }
+});
+
+// Xóa ghi chú của chính người dùng
+app.delete('/api/notes/:id', async (c) => {
+  const session = c.var.session;
+  if (!session?.signedIn) {
+    return c.json({ error: 'Chưa đăng nhập.' }, 401);
+  }
+
+  const id = Number(c.req.param('id'));
+  if (!Number.isInteger(id) || id <= 0) {
+    return c.json({ error: 'Mã ghi chú không hợp lệ.' }, 400);
+  }
+
+  try {
+    const deleted = await c.env.DB.prepare(
+      `DELETE FROM notes
+       WHERE id = ? AND user_email = ?
+       RETURNING id`
+    )
+      .bind(id, session.email)
+      .first<{ id: number }>();
+
+    if (!deleted) {
+      return c.json({ error: 'Không tìm thấy ghi chú hoặc bạn không có quyền xóa.' }, 404);
+    }
+
+    return c.json({ success: true, id: deleted.id });
+  } catch (err) {
+    console.error('Lỗi xóa ghi chú D1:', err);
+    return c.json({ error: 'Không thể xóa ghi chú. Vui lòng thử lại.' }, 500);
+  }
+});
+
+// Phục vụ các file tĩnh frontend đã build từ Vite
+app.all('*', async (c) => {
+  const assetResponse = await c.env.ASSETS.fetch(
+    c.req.raw as unknown as Parameters<Fetcher['fetch']>[0]
+  );
+  return assetResponse as unknown as Response;
+});
+
+export default app;

@@ -1,0 +1,6 @@
+{
+  "name": "Sổ Tay Nhanh",
+  "description": "Ứng dụng ghi chú cá nhân tối giản trên Cloudflare Workers và D1, đăng nhập bằng Gmail, giao diện tiếng Việt 100%.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

@@ -1,0 +1,27 @@
+name = "so-tay-nhanh"
+main = "worker/index.ts"
+compatibility_date = "2025-03-01"
+compatibility_flags = ["nodejs_compat"]
+
+# Cấu hình phục vụ frontend đã build từ Vite qua Cloudflare Workers Static Assets
+[assets]
+directory = "./dist"
+binding = "ASSETS"
+not_found_handling = "single-page-application"
+run_worker_first = ["/api/*", "/auth/*"]
+
+# Cấu hình binding cơ sở dữ liệu Cloudflare D1
+# Sau khi chạy `wrangler d1 create notes-db`, hãy thay database_id bằng ID thật của bạn
+[[d1_databases]]
+binding = "DB"
+database_name = "notes-db"
+database_id = "THAY_BANG_DATABASE_ID_CUA_BAN"
+
+# Biến môi trường không nhạy cảm (tùy chọn)
+[vars]
+AUTH_MODE = "livemode"
+
+# Các biến bí mật KHÔNG lưu trong file này, hãy thiết lập bằng lệnh:
+# npx wrangler secret put GOOGLE_CLIENT_ID
+# npx wrangler secret put GOOGLE_CLIENT_SECRET
+# npx wrangler secret put AUTH_SECRET
