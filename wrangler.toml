@@ -19,7 +19,7 @@ run_worker_first = ["/api/*", "/auth/*"]
 [[d1_databases]]
 binding = "DB"
 database_name = "notes-db"
-database_id = "THAY_BANG_DATABASE_ID_CUA_BAN"
+database_id = "ce87fad6-b6d5-46f1-b713-3d0aa3355ad6"
 
 # Biến môi trường không nhạy cảm (tùy chọn)
 [vars]
