@@ -1,9 +1,11 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { signOut } from 'firebase/auth';
 import { NotebookPen, Plus, RefreshCw, Search, X } from 'lucide-react';
 import { Header } from './components/Header';
 import { LoginScreen } from './components/LoginScreen';
 import { NoteCard } from './components/NoteCard';
 import { NoteModal } from './components/NoteModal';
+import { firebaseAuth } from './firebase';
 import type { AuthSessionResponse, Note } from './types/note';
 
 export default function App() {
@@ -177,8 +179,20 @@ export default function App() {
     showToast('Đã xóa ghi chú');
   }
 
-  function handleSignOut() {
-    window.location.assign('/auth/signout');
+  async function handleSignOut() {
+    try {
+      await signOut(firebaseAuth);
+    } catch {
+      // Tiếp tục xóa phiên phía máy chủ dù trình duyệt chưa có phiên Firebase cục bộ
+    }
+    await fetch('/auth/signout', {
+      method: 'POST',
+      credentials: 'same-origin',
+    });
+    setNotes([]);
+    setSearchInput('');
+    setDebouncedQuery('');
+    setAuth({ authenticated: false });
   }
 
   if (authLoading) {
@@ -216,14 +230,7 @@ export default function App() {
   }
 
   if (!auth.authenticated || !auth.user) {
-    return (
-      <LoginScreen
-        mode={auth.mode}
-        clientId={auth.clientId}
-        loginUri={auth.loginUri}
-        onTestSignedIn={fetchSession}
-      />
-    );
+    return <LoginScreen onSignedIn={fetchSession} />;
   }
 
   return (

@@ -21,11 +21,9 @@ binding = "DB"
 database_name = "notes-db"
 database_id = "ce87fad6-b6d5-46f1-b713-3d0aa3355ad6"
 
-# Biến môi trường không nhạy cảm (tùy chọn)
+# Biến môi trường không nhạy cảm
 [vars]
-AUTH_MODE = "livemode"
+FIREBASE_PROJECT_ID = "fast-tribute-0c62s"
 
-# Các biến bí mật KHÔNG lưu trong file này, hãy thiết lập bằng lệnh:
-# npx wrangler secret put GOOGLE_CLIENT_ID
-# npx wrangler secret put GOOGLE_CLIENT_SECRET
+# Khóa bí mật (tùy chọn, nên đặt trên production để ký session cookie):
 # npx wrangler secret put AUTH_SECRET

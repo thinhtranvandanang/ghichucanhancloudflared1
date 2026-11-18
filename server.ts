@@ -4,20 +4,10 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import express from 'express';
-import { Hono } from 'hono';
-import { getCookie } from 'hono/cookie';
-import {
-  honoSimpleGoogleAuth,
-  type GoogleAuthEnv,
-} from 'hono-simple-google-auth';
-
-interface ValidSessionData {
-  signedIn: true;
-  sessionId: string;
-  name: string;
-  email: string;
-  credential: string;
-}
+import { Hono, type Context } from 'hono';
+import { getCookie, setCookie } from 'hono/cookie';
+import firebaseConfig from './firebase-applet-config.json';
+import { verifyFirebaseIdToken } from './shared/firebaseJwt';
 
 const PORT = Number(process.env.PORT || 3000);
 const isProduction = process.env.NODE_ENV === 'production';
@@ -30,15 +20,17 @@ sqlite.exec(schemaSql);
 
 const SESSION_COOKIE_NAME = 'sotay_session';
 const SESSION_TTL_SECONDS = 60 * 60 * 24 * 30;
-const AUTH_SECRET = process.env.AUTH_SECRET || 'local-dev-secret-so-tay-nhanh-2026';
-const GOOGLE_CLIENT_ID = (process.env.GOOGLE_CLIENT_ID || '').trim();
-
-const hasRealGoogleClient =
-  GOOGLE_CLIENT_ID.length > 0 &&
-  !GOOGLE_CLIENT_ID.includes('YOUR_GOOGLE_CLIENT_ID');
+const FIREBASE_PROJECT_ID =
+  (process.env.FIREBASE_PROJECT_ID || firebaseConfig.projectId).trim();
+const AUTH_SECRET = process.env.AUTH_SECRET || FIREBASE_PROJECT_ID;
 
 function hashSessionId(sessionId: string): string {
   return crypto.createHmac('sha256', AUTH_SECRET).update(sessionId).digest('hex');
+}
+
+interface SessionUser {
+  email: string;
+  name: string;
 }
 
 interface NoteRow {
@@ -53,147 +45,144 @@ interface SessionRow {
   session_id: string;
   email: string;
   name: string;
-  credential: string;
-  created_at: string;
   expires_at: number;
 }
 
-const sqliteSessionStore = {
-  async get(sessionId: string): Promise<ValidSessionData | undefined> {
+type AppEnv = {
+  Variables: {
+    user?: SessionUser;
+  };
+};
+
+const honoApp = new Hono<AppEnv>();
+
+honoApp.post('/auth/firebase', async (c) => {
+  let body: { idToken?: unknown };
+  try {
+    body = await c.req.json();
+  } catch {
+    return c.json({ error: 'Dữ liệu đăng nhập không hợp lệ.' }, 400);
+  }
+
+  const idToken = typeof body.idToken === 'string' ? body.idToken.trim() : '';
+  if (!idToken) {
+    return c.json({ error: 'Thiếu mã xác thực Firebase.' }, 400);
+  }
+
+  try {
+    const firebaseUser = await verifyFirebaseIdToken(idToken, FIREBASE_PROJECT_ID);
+    const sessionId = crypto.randomUUID();
     const hashedId = hashSessionId(sessionId);
-    const now = Math.floor(Date.now() / 1000);
-    const stmt = sqlite.prepare(
-      'SELECT session_id, email, name, credential, expires_at FROM sessions WHERE session_id = ?'
-    );
-    const row = stmt.get(hashedId) as SessionRow | undefined;
-    if (!row) return undefined;
-
-    if (row.expires_at <= now) {
-      sqlite.prepare('DELETE FROM sessions WHERE session_id = ?').run(hashedId);
-      return undefined;
-    }
-
-    return {
-      signedIn: true,
-      sessionId,
-      email: row.email,
-      name: row.name,
-      credential: row.credential,
-    };
-  },
-
-  async put(data: ValidSessionData): Promise<void> {
-    const hashedId = hashSessionId(data.sessionId);
     const nowIso = new Date().toISOString();
     const expiresAt = Math.floor(Date.now() / 1000) + SESSION_TTL_SECONDS;
+
     sqlite
       .prepare(
         `INSERT INTO sessions (session_id, email, name, credential, created_at, expires_at)
-         VALUES (?, ?, ?, ?, ?, ?)
-         ON CONFLICT(session_id) DO UPDATE SET
-           email = excluded.email,
-           name = excluded.name,
-           credential = excluded.credential,
-           expires_at = excluded.expires_at`
+         VALUES (?, ?, ?, ?, ?, ?)`
       )
-      .run(
-        hashedId,
-        data.email,
-        data.name || data.email,
-        data.credential || '',
-        nowIso,
-        expiresAt
-      );
-  },
+      .run(hashedId, firebaseUser.email, firebaseUser.name, 'firebase', nowIso, expiresAt);
 
-  async delete(sessionId: string): Promise<void> {
+    const url = new URL(c.req.url);
+    setCookie(c, SESSION_COOKIE_NAME, sessionId, {
+      httpOnly: true,
+      sameSite: 'Lax',
+      secure: url.protocol === 'https:',
+      path: '/',
+      maxAge: SESSION_TTL_SECONDS,
+    });
+
+    return c.json({
+      authenticated: true,
+      user: {
+        email: firebaseUser.email,
+        name: firebaseUser.name,
+      },
+    });
+  } catch (err) {
+    console.error('Lỗi xác thực Firebase ID Token:', err);
+    return c.json(
+      {
+        error:
+          err instanceof Error
+            ? err.message
+            : 'Không thể xác thực tài khoản Gmail. Vui lòng thử lại.',
+      },
+      401
+    );
+  }
+});
+
+async function handleSignOut(c: Context<AppEnv>) {
+  const sessionId = getCookie(c, SESSION_COOKIE_NAME);
+  if (sessionId) {
     const hashedId = hashSessionId(sessionId);
     sqlite.prepare('DELETE FROM sessions WHERE session_id = ?').run(hashedId);
-  },
-};
-
-const honoApp = new Hono<GoogleAuthEnv>();
-
-const googleAuth = honoSimpleGoogleAuth<GoogleAuthEnv>(async (c) => {
-  const url = new URL(c.req.url);
-  const callbackUrl = `${url.protocol}//${url.host}/auth/callback`;
-  return {
-    clientId: hasRealGoogleClient ? GOOGLE_CLIENT_ID : 'local-preview-client-id',
-    callbackUrl,
-    cookieName: SESSION_COOKIE_NAME,
-    sessionDurationSeconds: SESSION_TTL_SECONDS,
-    sessionStore: sqliteSessionStore,
-    mode: hasRealGoogleClient ? 'livemode' : 'testmode',
-  };
-});
-
-honoApp.use('/auth/*', async (c, next) => {
-  const url = new URL(c.req.url);
-
-  if (url.pathname === '/auth/signout') {
-    const cookieName = hasRealGoogleClient ? SESSION_COOKIE_NAME : 'testmode-session-id';
-    const sessionId = getCookie(c, cookieName);
-    if (sessionId) {
-      await sqliteSessionStore.delete(sessionId);
-    }
   }
 
+  const url = new URL(c.req.url);
+  setCookie(c, SESSION_COOKIE_NAME, '', {
+    httpOnly: true,
+    sameSite: 'Lax',
+    secure: url.protocol === 'https:',
+    path: '/',
+    maxAge: 0,
+  });
+
+  return c.json({ success: true });
+}
+
+honoApp.post('/auth/signout', handleSignOut);
+honoApp.get('/auth/signout', async (c) => {
+  await handleSignOut(c);
+  return c.redirect('/');
+});
+
+honoApp.use('/api/*', async (c, next) => {
+  const sessionId = getCookie(c, SESSION_COOKIE_NAME);
+  if (sessionId) {
+    const hashedId = hashSessionId(sessionId);
+    const now = Math.floor(Date.now() / 1000);
+    const row = sqlite
+      .prepare('SELECT session_id, email, name, expires_at FROM sessions WHERE session_id = ?')
+      .get(hashedId) as SessionRow | undefined;
+
+    if (row) {
+      if (row.expires_at > now) {
+        c.set('user', { email: row.email, name: row.name });
+      } else {
+        sqlite.prepare('DELETE FROM sessions WHERE session_id = ?').run(hashedId);
+      }
+    }
+  }
   await next();
-
-  const setCookieHeader = c.res.headers.get('Set-Cookie');
-  if (setCookieHeader) {
-    let updated = setCookieHeader;
-    if (!/\bHttpOnly\b/i.test(updated)) {
-      updated += '; HttpOnly';
-    }
-    if (url.protocol === 'https:' && !/\bSecure\b/i.test(updated)) {
-      updated += '; Secure';
-    }
-    c.res.headers.set('Set-Cookie', updated);
-  }
 });
-
-honoApp.route('/auth', googleAuth.routes);
-honoApp.use('/api/*', googleAuth.session);
 
 honoApp.get('/api/me', async (c) => {
-  const session = c.var.session;
-  const url = new URL(c.req.url);
-  const loginUri = `${url.protocol}//${url.host}/auth/callback`;
-  const mode = hasRealGoogleClient ? 'livemode' : 'testmode';
-
-  if (!session?.signedIn || !session.email) {
-    return c.json({
-      authenticated: false,
-      mode,
-      clientId: hasRealGoogleClient ? GOOGLE_CLIENT_ID : '',
-      loginUri,
-    });
+  const user = c.get('user');
+  if (!user) {
+    return c.json({ authenticated: false });
   }
-
   return c.json({
     authenticated: true,
-    mode,
-    clientId: hasRealGoogleClient ? GOOGLE_CLIENT_ID : '',
-    loginUri,
-    user: {
-      email: session.email,
-      name: session.name || session.email,
-    },
+    user,
   });
 });
 
 honoApp.use('/api/notes*', async (c, next) => {
-  const session = c.var.session;
-  if (!session?.signedIn || !session.email) {
-    return c.json({ error: 'Phiên đăng nhập đã hết hạn. Vui lòng đăng nhập lại bằng Gmail.' }, 401);
+  const user = c.get('user');
+  if (!user) {
+    return c.json(
+      { error: 'Phiên đăng nhập đã hết hạn. Vui lòng đăng nhập lại bằng Gmail.' },
+      401
+    );
   }
   await next();
 });
 
 honoApp.get('/api/notes', async (c) => {
-  const session = c.var.session;
-  if (!session?.signedIn) {
+  const user = c.get('user');
+  if (!user) {
     return c.json({ error: 'Chưa đăng nhập.' }, 401);
   }
 
@@ -205,7 +194,7 @@ honoApp.get('/api/notes', async (c) => {
        WHERE user_email = ?
        ORDER BY created_at DESC, id DESC`
     )
-    .all(session.email) as unknown as NoteRow[];
+    .all(user.email) as unknown as NoteRow[];
 
   let notes = rows;
   if (query.length > 0) {
@@ -221,8 +210,8 @@ honoApp.get('/api/notes', async (c) => {
 });
 
 honoApp.post('/api/notes', async (c) => {
-  const session = c.var.session;
-  if (!session?.signedIn) {
+  const user = c.get('user');
+  if (!user) {
     return c.json({ error: 'Chưa đăng nhập.' }, 401);
   }
 
@@ -253,14 +242,14 @@ honoApp.post('/api/notes', async (c) => {
        VALUES (?, ?, ?, ?)
        RETURNING id, user_email, title, content, created_at`
     )
-    .get(session.email, title, content, createdAt) as unknown as NoteRow;
+    .get(user.email, title, content, createdAt) as unknown as NoteRow;
 
   return c.json({ note: inserted }, 201);
 });
 
 honoApp.put('/api/notes/:id', async (c) => {
-  const session = c.var.session;
-  if (!session?.signedIn) {
+  const user = c.get('user');
+  if (!user) {
     return c.json({ error: 'Chưa đăng nhập.' }, 401);
   }
 
@@ -296,7 +285,7 @@ honoApp.put('/api/notes/:id', async (c) => {
        WHERE id = ? AND user_email = ?
        RETURNING id, user_email, title, content, created_at`
     )
-    .get(title, content, id, session.email) as unknown as NoteRow | undefined;
+    .get(title, content, id, user.email) as unknown as NoteRow | undefined;
 
   if (!updated) {
     return c.json({ error: 'Không tìm thấy ghi chú hoặc bạn không có quyền sửa.' }, 404);
@@ -306,8 +295,8 @@ honoApp.put('/api/notes/:id', async (c) => {
 });
 
 honoApp.delete('/api/notes/:id', async (c) => {
-  const session = c.var.session;
-  if (!session?.signedIn) {
+  const user = c.get('user');
+  if (!user) {
     return c.json({ error: 'Chưa đăng nhập.' }, 401);
   }
 
@@ -322,7 +311,7 @@ honoApp.delete('/api/notes/:id', async (c) => {
        WHERE id = ? AND user_email = ?
        RETURNING id`
     )
-    .get(id, session.email) as unknown as { id: number } | undefined;
+    .get(id, user.email) as unknown as { id: number } | undefined;
 
   if (!deleted) {
     return c.json({ error: 'Không tìm thấy ghi chú hoặc bạn không có quyền xóa.' }, 404);
@@ -335,7 +324,6 @@ async function startServer() {
   const expressApp = express();
   expressApp.set('trust proxy', true);
 
-  // Chuyển tiếp /api/* và /auth/* sang Hono app
   expressApp.use(['/api', '/auth'], async (req, res, next) => {
     try {
       const proto = (req.headers['x-forwarded-proto'] as string) || req.protocol || 'http';

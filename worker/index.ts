@@ -1,31 +1,26 @@
-import { Hono } from 'hono';
-import { getCookie } from 'hono/cookie';
-import {
-  honoSimpleGoogleAuth,
-  type GoogleAuthEnv,
-} from 'hono-simple-google-auth';
+import { Hono, type Context } from 'hono';
+import { getCookie, setCookie } from 'hono/cookie';
 import type { D1Database, Fetcher } from '@cloudflare/workers-types';
-import { VietnameseSignInPage } from './signInPage';
-
-interface ValidSessionData {
-  signedIn: true;
-  sessionId: string;
-  name: string;
-  email: string;
-  credential: string;
-}
+import firebaseConfig from '../firebase-applet-config.json';
+import { verifyFirebaseIdToken } from '../shared/firebaseJwt';
 
 export type WorkerBindings = {
   DB: D1Database;
   ASSETS: Fetcher;
-  GOOGLE_CLIENT_ID: string;
-  GOOGLE_CLIENT_SECRET: string;
-  AUTH_SECRET: string;
-  AUTH_MODE?: 'livemode' | 'testmode';
+  FIREBASE_PROJECT_ID?: string;
+  AUTH_SECRET?: string;
 };
 
-type AppEnv = GoogleAuthEnv & {
+interface SessionUser {
+  email: string;
+  name: string;
+}
+
+type AppEnv = {
   Bindings: WorkerBindings;
+  Variables: {
+    user?: SessionUser;
+  };
 };
 
 interface NoteRow {
@@ -40,22 +35,17 @@ interface SessionRow {
   session_id: string;
   email: string;
   name: string;
-  credential: string;
-  created_at: string;
   expires_at: number;
 }
 
 const SESSION_COOKIE_NAME = 'sotay_session';
 const SESSION_TTL_SECONDS = 60 * 60 * 24 * 30; // 30 ngày
 
-/**
- * Tạo mã băm HMAC-SHA256 từ sessionId và AUTH_SECRET để không lưu sessionId gốc trong D1.
- */
 async function hashSessionId(sessionId: string, secret: string): Promise<string> {
   const encoder = new TextEncoder();
   const key = await crypto.subtle.importKey(
     'raw',
-    encoder.encode(secret || 'fallback-dev-secret-change-me'),
+    encoder.encode(secret || 'sotay-default-session-secret'),
     { name: 'HMAC', hash: 'SHA-256' },
     false,
     ['sign']
@@ -66,150 +56,157 @@ async function hashSessionId(sessionId: string, secret: string): Promise<string>
     .join('');
 }
 
-/**
- * Tạo SessionStore lưu trữ phiên đăng nhập vào Cloudflare D1 (không cần KV).
- */
-function createD1SessionStore(db: D1Database, authSecret: string) {
-  return {
-    async get(sessionId: string): Promise<ValidSessionData | undefined> {
-      const hashedId = await hashSessionId(sessionId, authSecret);
-      const now = Math.floor(Date.now() / 1000);
+const app = new Hono<AppEnv>();
 
-      const row = await db
-        .prepare(
-          'SELECT session_id, email, name, credential, expires_at FROM sessions WHERE session_id = ?'
-        )
+// Xác thực bằng Firebase ID Token (đăng nhập Gmail từ Firebase Auth)
+app.post('/auth/firebase', async (c) => {
+  let body: { idToken?: unknown };
+  try {
+    body = await c.req.json();
+  } catch {
+    return c.json({ error: 'Dữ liệu đăng nhập không hợp lệ.' }, 400);
+  }
+
+  const idToken = typeof body.idToken === 'string' ? body.idToken.trim() : '';
+  if (!idToken) {
+    return c.json({ error: 'Thiếu mã xác thực Firebase.' }, 400);
+  }
+
+  const projectId = (c.env.FIREBASE_PROJECT_ID || firebaseConfig.projectId).trim();
+  const authSecret = c.env.AUTH_SECRET || projectId;
+
+  try {
+    const firebaseUser = await verifyFirebaseIdToken(idToken, projectId);
+    const sessionId = crypto.randomUUID();
+    const hashedId = await hashSessionId(sessionId, authSecret);
+    const nowIso = new Date().toISOString();
+    const expiresAt = Math.floor(Date.now() / 1000) + SESSION_TTL_SECONDS;
+
+    await c.env.DB.prepare(
+      `INSERT INTO sessions (session_id, email, name, credential, created_at, expires_at)
+       VALUES (?, ?, ?, ?, ?, ?)`
+    )
+      .bind(hashedId, firebaseUser.email, firebaseUser.name, 'firebase', nowIso, expiresAt)
+      .run();
+
+    const url = new URL(c.req.url);
+    setCookie(c, SESSION_COOKIE_NAME, sessionId, {
+      httpOnly: true,
+      sameSite: 'Lax',
+      secure: url.protocol === 'https:',
+      path: '/',
+      maxAge: SESSION_TTL_SECONDS,
+    });
+
+    return c.json({
+      authenticated: true,
+      user: {
+        email: firebaseUser.email,
+        name: firebaseUser.name,
+      },
+    });
+  } catch (err) {
+    console.error('Lỗi xác thực Firebase ID Token:', err);
+    return c.json(
+      {
+        error:
+          err instanceof Error
+            ? err.message
+            : 'Không thể xác thực tài khoản Gmail. Vui lòng thử lại.',
+      },
+      401
+    );
+  }
+});
+
+// Đăng xuất: xóa phiên trong D1 và xóa cookie
+async function handleSignOut(c: Context<AppEnv>) {
+  const sessionId = getCookie(c, SESSION_COOKIE_NAME);
+  const projectId = (c.env.FIREBASE_PROJECT_ID || firebaseConfig.projectId).trim();
+  const authSecret = c.env.AUTH_SECRET || projectId;
+
+  if (sessionId) {
+    const hashedId = await hashSessionId(sessionId, authSecret);
+    await c.env.DB.prepare('DELETE FROM sessions WHERE session_id = ?').bind(hashedId).run();
+  }
+
+  const url = new URL(c.req.url);
+  setCookie(c, SESSION_COOKIE_NAME, '', {
+    httpOnly: true,
+    sameSite: 'Lax',
+    secure: url.protocol === 'https:',
+    path: '/',
+    maxAge: 0,
+  });
+
+  return c.json({ success: true });
+}
+
+app.post('/auth/signout', handleSignOut);
+app.get('/auth/signout', async (c) => {
+  await handleSignOut(c);
+  return c.redirect('/');
+});
+
+// Middleware đọc phiên từ cookie HttpOnly cho toàn bộ /api/*
+app.use('/api/*', async (c, next) => {
+  const sessionId = getCookie(c, SESSION_COOKIE_NAME);
+  if (sessionId) {
+    const projectId = (c.env.FIREBASE_PROJECT_ID || firebaseConfig.projectId).trim();
+    const authSecret = c.env.AUTH_SECRET || projectId;
+    const hashedId = await hashSessionId(sessionId, authSecret);
+    const now = Math.floor(Date.now() / 1000);
+
+    try {
+      const row = await c.env.DB.prepare(
+        'SELECT session_id, email, name, expires_at FROM sessions WHERE session_id = ?'
+      )
         .bind(hashedId)
         .first<SessionRow>();
 
-      if (!row) return undefined;
-
-      if (row.expires_at <= now) {
-        await db.prepare('DELETE FROM sessions WHERE session_id = ?').bind(hashedId).run();
-        return undefined;
+      if (row) {
+        if (row.expires_at > now) {
+          c.set('user', { email: row.email, name: row.name });
+        } else {
+          await c.env.DB.prepare('DELETE FROM sessions WHERE session_id = ?').bind(hashedId).run();
+        }
       }
-
-      return {
-        signedIn: true,
-        sessionId,
-        email: row.email,
-        name: row.name,
-        credential: row.credential,
-      };
-    },
-
-    async put(data: ValidSessionData): Promise<void> {
-      const hashedId = await hashSessionId(data.sessionId, authSecret);
-      const nowIso = new Date().toISOString();
-      const expiresAt = Math.floor(Date.now() / 1000) + SESSION_TTL_SECONDS;
-
-      await db
-        .prepare(
-          `INSERT INTO sessions (session_id, email, name, credential, created_at, expires_at)
-           VALUES (?, ?, ?, ?, ?, ?)
-           ON CONFLICT(session_id) DO UPDATE SET
-             email = excluded.email,
-             name = excluded.name,
-             credential = excluded.credential,
-             expires_at = excluded.expires_at`
-        )
-        .bind(hashedId, data.email, data.name || data.email, data.credential || '', nowIso, expiresAt)
-        .run();
-    },
-
-    async delete(sessionId: string): Promise<void> {
-      const hashedId = await hashSessionId(sessionId, authSecret);
-      await db.prepare('DELETE FROM sessions WHERE session_id = ?').bind(hashedId).run();
-    },
-  };
-}
-
-const app = new Hono<AppEnv>();
-
-const googleAuth = honoSimpleGoogleAuth<AppEnv>(async (c) => {
-  const url = new URL(c.req.url);
-  const callbackUrl = `${url.protocol}//${url.host}/auth/callback`;
-  const mode = c.env.AUTH_MODE === 'testmode' ? 'testmode' : 'livemode';
-
-  return {
-    clientId: c.env.GOOGLE_CLIENT_ID || '',
-    callbackUrl,
-    cookieName: SESSION_COOKIE_NAME,
-    sessionDurationSeconds: SESSION_TTL_SECONDS,
-    sessionStore: createD1SessionStore(c.env.DB, c.env.AUTH_SECRET),
-    mode,
-    renderSignInPage: VietnameseSignInPage,
-  };
-});
-
-// Middleware bảo mật cookie: đảm bảo HttpOnly, SameSite=Lax và Secure (trên HTTPS)
-app.use('/auth/*', async (c, next) => {
-  const url = new URL(c.req.url);
-
-  // Khi đăng xuất, xóa bản ghi session trong D1 trước khi thư viện xóa cookie
-  if (url.pathname === '/auth/signout') {
-    const sessionId = getCookie(c, SESSION_COOKIE_NAME);
-    if (sessionId) {
-      const hashedId = await hashSessionId(sessionId, c.env.AUTH_SECRET);
-      await c.env.DB.prepare('DELETE FROM sessions WHERE session_id = ?').bind(hashedId).run();
+    } catch (err) {
+      console.error('Lỗi đọc phiên D1:', err);
     }
   }
 
   await next();
-
-  const setCookieHeader = c.res.headers.get('Set-Cookie');
-  if (setCookieHeader && url.protocol === 'https:' && !/\bSecure\b/i.test(setCookieHeader)) {
-    c.res.headers.set('Set-Cookie', `${setCookieHeader}; Secure`);
-  }
 });
-
-// Gắn các route xác thực: /auth/signin, /auth/callback, /auth/signout
-app.route('/auth', googleAuth.routes);
-
-// Gắn session middleware cho toàn bộ API
-app.use('/api/*', googleAuth.session);
 
 // Kiểm tra trạng thái đăng nhập hiện tại
 app.get('/api/me', async (c) => {
-  const session = c.var.session;
-  const mode = c.env.AUTH_MODE === 'testmode' ? 'testmode' : 'livemode';
-  const url = new URL(c.req.url);
-  const loginUri = `${url.protocol}//${url.host}/auth/callback`;
-
-  if (!session?.signedIn || !session.email) {
-    return c.json({
-      authenticated: false,
-      mode,
-      clientId: c.env.GOOGLE_CLIENT_ID || '',
-      loginUri,
-    });
+  const user = c.get('user');
+  if (!user) {
+    return c.json({ authenticated: false });
   }
-
   return c.json({
     authenticated: true,
-    mode,
-    clientId: c.env.GOOGLE_CLIENT_ID || '',
-    loginUri,
-    user: {
-      email: session.email,
-      name: session.name || session.email,
-    },
+    user,
   });
 });
 
 // Middleware bắt buộc đăng nhập cho mọi thao tác ghi chú
 app.use('/api/notes*', async (c, next) => {
-  const session = c.var.session;
-  if (!session?.signedIn || !session.email) {
-    return c.json({ error: 'Phiên đăng nhập đã hết hạn. Vui lòng đăng nhập lại bằng Gmail.' }, 401);
+  const user = c.get('user');
+  if (!user) {
+    return c.json(
+      { error: 'Phiên đăng nhập đã hết hạn. Vui lòng đăng nhập lại bằng Gmail.' },
+      401
+    );
   }
   await next();
 });
 
 // Lấy danh sách ghi chú của người dùng (mới nhất lên đầu) + tìm kiếm theo từ khóa
 app.get('/api/notes', async (c) => {
-  const session = c.var.session;
-  if (!session?.signedIn) {
+  const user = c.get('user');
+  if (!user) {
     return c.json({ error: 'Chưa đăng nhập.' }, 401);
   }
 
@@ -222,7 +219,7 @@ app.get('/api/notes', async (c) => {
        WHERE user_email = ?
        ORDER BY created_at DESC, id DESC`
     )
-      .bind(session.email)
+      .bind(user.email)
       .all<NoteRow>();
 
     let notes = result.results || [];
@@ -245,8 +242,8 @@ app.get('/api/notes', async (c) => {
 
 // Tạo ghi chú mới (created_at do server tự sinh theo chuẩn ISO 8601)
 app.post('/api/notes', async (c) => {
-  const session = c.var.session;
-  if (!session?.signedIn) {
+  const user = c.get('user');
+  if (!user) {
     return c.json({ error: 'Chưa đăng nhập.' }, 401);
   }
 
@@ -278,7 +275,7 @@ app.post('/api/notes', async (c) => {
        VALUES (?, ?, ?, ?)
        RETURNING id, user_email, title, content, created_at`
     )
-      .bind(session.email, title, content, createdAt)
+      .bind(user.email, title, content, createdAt)
       .first<NoteRow>();
 
     return c.json({ note: inserted }, 201);
@@ -290,8 +287,8 @@ app.post('/api/notes', async (c) => {
 
 // Cập nhật ghi chú của chính người dùng
 app.put('/api/notes/:id', async (c) => {
-  const session = c.var.session;
-  if (!session?.signedIn) {
+  const user = c.get('user');
+  if (!user) {
     return c.json({ error: 'Chưa đăng nhập.' }, 401);
   }
 
@@ -327,7 +324,7 @@ app.put('/api/notes/:id', async (c) => {
        WHERE id = ? AND user_email = ?
        RETURNING id, user_email, title, content, created_at`
     )
-      .bind(title, content, id, session.email)
+      .bind(title, content, id, user.email)
       .first<NoteRow>();
 
     if (!updated) {
@@ -343,8 +340,8 @@ app.put('/api/notes/:id', async (c) => {
 
 // Xóa ghi chú của chính người dùng
 app.delete('/api/notes/:id', async (c) => {
-  const session = c.var.session;
-  if (!session?.signedIn) {
+  const user = c.get('user');
+  if (!user) {
     return c.json({ error: 'Chưa đăng nhập.' }, 401);
   }
 
@@ -359,7 +356,7 @@ app.delete('/api/notes/:id', async (c) => {
        WHERE id = ? AND user_email = ?
        RETURNING id`
     )
-      .bind(id, session.email)
+      .bind(id, user.email)
       .first<{ id: number }>();
 
     if (!deleted) {

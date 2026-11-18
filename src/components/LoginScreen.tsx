@@ -1,122 +1,57 @@
-import { useEffect, useRef, useState, type FormEvent } from 'react';
-import { Lock, Mail, NotebookPen, ShieldCheck, Sparkles } from 'lucide-react';
+import { useState } from 'react';
+import { signInWithPopup } from 'firebase/auth';
+import { Lock, NotebookPen, ShieldCheck } from 'lucide-react';
+import { firebaseAuth, googleProvider } from '../firebase';
 
 interface LoginScreenProps {
-  mode: 'livemode' | 'testmode';
-  clientId: string;
-  loginUri: string;
-  onTestSignedIn: () => Promise<void>;
+  onSignedIn: () => Promise<void>;
 }
 
-export function LoginScreen({
-  mode,
-  clientId,
-  loginUri,
-  onTestSignedIn,
-}: LoginScreenProps) {
-  const gsiContainerRef = useRef<HTMLDivElement>(null);
-  const [gsiReady, setGsiReady] = useState(false);
+function getFirebaseErrorMessage(code: string | undefined, fallback?: string): string {
+  switch (code) {
+    case 'auth/popup-closed-by-user':
+      return 'Bạn đã đóng cửa sổ đăng nhập trước khi hoàn tất.';
+    case 'auth/cancelled-popup-request':
+      return 'Yêu cầu đăng nhập trước đó đã bị hủy. Vui lòng thử lại.';
+    case 'auth/popup-blocked':
+      return 'Trình duyệt đã chặn cửa sổ bật lên (popup). Vui lòng cho phép popup rồi thử lại.';
+    case 'auth/unauthorized-domain':
+      return 'Tên miền hiện tại chưa được thêm vào Authorized domains trong Firebase Console.';
+    case 'auth/network-request-failed':
+      return 'Kết nối mạng bị gián đoạn. Vui lòng kiểm tra Internet và thử lại.';
+    default:
+      return fallback || 'Không thể đăng nhập bằng Gmail. Vui lòng thử lại.';
+  }
+}
 
-  // State cho chế độ xem trước cục bộ (khi chưa gắn GOOGLE_CLIENT_ID)
-  const [email, setEmail] = useState('');
-  const [name, setName] = useState('');
+export function LoginScreen({ onSignedIn }: LoginScreenProps) {
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  useEffect(() => {
-    if (mode !== 'livemode' || !clientId) return;
-
-    const existingScript = document.querySelector<HTMLScriptElement>(
-      'script[src="https://accounts.google.com/gsi/client"]'
-    );
-
-    const initGsi = () => {
-      const googleApi = (window as unknown as {
-        google?: {
-          accounts?: {
-            id?: {
-              initialize: (cfg: Record<string, unknown>) => void;
-              renderButton: (el: HTMLElement, opts: Record<string, unknown>) => void;
-            };
-          };
-        };
-      }).google;
-
-      if (!googleApi?.accounts?.id || !gsiContainerRef.current) return;
-
-      googleApi.accounts.id.initialize({
-        client_id: clientId,
-        ux_mode: 'redirect',
-        login_uri: loginUri,
-        auto_prompt: false,
-      });
-
-      gsiContainerRef.current.innerHTML = '';
-      googleApi.accounts.id.renderButton(gsiContainerRef.current, {
-        type: 'standard',
-        theme: 'outline',
-        size: 'large',
-        text: 'signin_with',
-        shape: 'rectangular',
-        logo_alignment: 'left',
-        locale: 'vi',
-        width: 280,
-      });
-      setGsiReady(true);
-    };
-
-    if (existingScript) {
-      initGsi();
-      return;
-    }
-
-    const script = document.createElement('script');
-    script.src = 'https://accounts.google.com/gsi/client';
-    script.async = true;
-    script.defer = true;
-    script.onload = initGsi;
-    document.head.appendChild(script);
-  }, [mode, clientId, loginUri]);
-
-  async function handleTestSubmit(e: FormEvent) {
-    e.preventDefault();
+  async function handleGoogleSignIn() {
     setError(null);
-
-    const trimmedEmail = email.trim().toLowerCase();
-    const trimmedName = name.trim() || trimmedEmail.split('@')[0] || 'Người dùng';
-
-    if (!trimmedEmail || !trimmedEmail.includes('@')) {
-      setError('Vui lòng nhập địa chỉ Gmail hợp lệ.');
-      return;
-    }
-
     setSubmitting(true);
-    try {
-      const sessionID =
-        typeof crypto !== 'undefined' && crypto.randomUUID
-          ? crypto.randomUUID()
-          : `local-${Date.now()}`;
 
-      const res = await fetch('/auth/test/signin', {
+    try {
+      const credential = await signInWithPopup(firebaseAuth, googleProvider);
+      const idToken = await credential.user.getIdToken();
+
+      const res = await fetch('/auth/firebase', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          email: trimmedEmail,
-          name: trimmedName,
-          sessionID,
-        }),
+        credentials: 'same-origin',
+        body: JSON.stringify({ idToken }),
       });
 
       if (!res.ok) {
-        const data = (await res.json().catch(() => ({}))) as { error?: string };
-        throw new Error(data.error || 'Không thể đăng nhập. Vui lòng thử lại.');
+        const body = (await res.json().catch(() => ({}))) as { error?: string };
+        throw new Error(body.error || 'Không thể tạo phiên đăng nhập trên máy chủ.');
       }
 
-      await onTestSignedIn();
+      await onSignedIn();
     } catch (err) {
-      setError(
-        err instanceof Error ? err.message : 'Đã xảy ra lỗi khi đăng nhập.'
-      );
+      const firebaseErr = err as { code?: string; message?: string };
+      setError(getFirebaseErrorMessage(firebaseErr.code, firebaseErr.message));
     } finally {
       setSubmitting(false);
     }
@@ -141,97 +76,55 @@ export function LoginScreen({
           Ghi lại mọi ý tưởng trong vài giây
         </h2>
         <p className="text-[15px] text-slate-600 leading-relaxed mb-6">
-          Đăng nhập bằng Gmail để bắt đầu tạo, tìm kiếm và đồng bộ ghi chú riêng tư trên mọi thiết bị.
+          Đăng nhập bằng Gmail qua Firebase Auth để tạo, tìm kiếm và đồng bộ ghi chú riêng tư trên mọi thiết bị.
         </p>
 
-        {mode === 'livemode' ? (
-          <div className="space-y-4">
+        <div className="space-y-4">
+          <button
+            type="button"
+            disabled={submitting}
+            onClick={handleGoogleSignIn}
+            className="w-full min-h-[48px] inline-flex items-center justify-center gap-3 px-4 py-3 rounded-xl border border-slate-200 bg-white hover:bg-slate-50 hover:border-green-400 disabled:opacity-60 text-slate-800 font-semibold text-[15px] shadow-xs transition-colors cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-green-500"
+          >
+            <svg className="w-5 h-5 shrink-0" viewBox="0 0 24 24" aria-hidden="true">
+              <path
+                fill="#4285F4"
+                d="M23.745 12.27c0-.7-.06-1.4-.19-2.07H12v4.51h6.6c-.29 1.52-1.14 2.82-2.4 3.68v3.05h3.88c2.27-2.09 3.665-5.17 3.665-9.17Z"
+              />
+              <path
+                fill="#34A853"
+                d="M12 24c3.24 0 5.95-1.08 7.93-2.91l-3.88-3.05c-1.08.72-2.45 1.16-4.05 1.16-3.12 0-5.77-2.11-6.72-4.96H1.29v3.14C3.26 21.3 7.31 24 12 24Z"
+              />
+              <path
+                fill="#FBBC05"
+                d="M5.28 14.24c-.24-.72-.38-1.49-.38-2.24s.14-1.52.38-2.24V6.62H1.29C.47 8.24 0 10.06 0 12s.47 3.76 1.29 5.38l3.99-3.14Z"
+              />
+              <path
+                fill="#EA4335"
+                d="M12 4.75c1.77 0 3.35.61 4.6 1.8l3.42-3.42C17.95 1.19 15.24 0 12 0 7.31 0 3.26 2.7 1.29 6.62l3.99 3.14c.95-2.85 3.6-4.96 6.72-4.96Z"
+              />
+            </svg>
+            <span>{submitting ? 'Đang kết nối Gmail...' : 'Đăng nhập bằng Gmail'}</span>
+          </button>
+
+          {error && (
             <div
-              ref={gsiContainerRef}
-              className="flex justify-center min-h-[44px]"
-            />
-
-            {!gsiReady && (
-              <a
-                href="/auth/signin"
-                className="w-full min-h-[44px] inline-flex items-center justify-center gap-2.5 px-4 py-2.5 rounded-xl bg-green-600 hover:bg-green-700 text-white font-semibold text-sm transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-green-500"
-              >
-                <Mail className="w-4 h-4" aria-hidden="true" />
-                <span>Đăng nhập bằng Gmail</span>
-              </a>
-            )}
-
-            <p className="text-xs text-slate-500 text-center pt-1">
-              Mỗi tài khoản Gmail có không gian ghi chú tách biệt hoàn toàn.
-            </p>
-          </div>
-        ) : (
-          <form onSubmit={handleTestSubmit} className="space-y-4">
-            <div className="p-3.5 rounded-2xl bg-orange-50 border border-orange-200 text-xs text-orange-900 leading-relaxed">
-              <span className="font-semibold">Chế độ xem trước cục bộ:</span>{' '}
-              Biến <code className="font-mono">GOOGLE_CLIENT_ID</code> chưa được cấu hình trên máy chủ xem trước. Nhập Gmail bất kỳ để kiểm tra tính năng tách dữ liệu theo từng người dùng.
-            </div>
-
-            <div>
-              <label
-                htmlFor="login-email"
-                className="block text-sm font-medium text-slate-700 mb-1.5"
-              >
-                Địa chỉ Gmail
-              </label>
-              <input
-                id="login-email"
-                type="email"
-                required
-                autoFocus
-                value={email}
-                onChange={(e) => setEmail(e.target.value)}
-                placeholder="vi-du@gmail.com"
-                className="w-full min-h-[44px] px-3.5 py-2.5 rounded-xl border border-slate-200 bg-white text-slate-900 placeholder:text-slate-400 text-[15px] focus:outline-none focus:border-green-500 focus:ring-2 focus:ring-green-500/20"
-              />
-            </div>
-
-            <div>
-              <label
-                htmlFor="login-name"
-                className="block text-sm font-medium text-slate-700 mb-1.5"
-              >
-                Tên hiển thị (tùy chọn)
-              </label>
-              <input
-                id="login-name"
-                type="text"
-                value={name}
-                onChange={(e) => setName(e.target.value)}
-                placeholder="Ví dụ: Minh Anh"
-                className="w-full min-h-[44px] px-3.5 py-2.5 rounded-xl border border-slate-200 bg-white text-slate-900 placeholder:text-slate-400 text-[15px] focus:outline-none focus:border-green-500 focus:ring-2 focus:ring-green-500/20"
-              />
-            </div>
-
-            {error && (
-              <div
-                role="alert"
-                className="p-3 rounded-xl bg-red-50 border border-red-200 text-sm text-red-700"
-              >
-                {error}
-              </div>
-            )}
-
-            <button
-              type="submit"
-              disabled={submitting}
-              className="w-full min-h-[46px] inline-flex items-center justify-center gap-2 px-4 py-2.5 rounded-xl bg-green-600 hover:bg-green-700 disabled:opacity-60 text-white font-semibold text-[15px] transition-colors cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-green-500"
+              role="alert"
+              className="p-3.5 rounded-xl bg-red-50 border border-red-200 text-sm text-red-700 leading-relaxed"
             >
-              <Mail className="w-4 h-4" aria-hidden="true" />
-              <span>{submitting ? 'Đang đăng nhập...' : 'Tiếp tục với Gmail'}</span>
-            </button>
-          </form>
-        )}
+              {error}
+            </div>
+          )}
+
+          <p className="text-xs text-slate-500 text-center pt-1">
+            Mỗi tài khoản Gmail có không gian ghi chú tách biệt hoàn toàn.
+          </p>
+        </div>
 
         <div className="mt-7 pt-5 border-t border-slate-100 grid grid-cols-2 gap-3 text-xs text-slate-500">
           <div className="flex items-center gap-2">
             <ShieldCheck className="w-4 h-4 text-green-600 shrink-0" aria-hidden="true" />
-            <span>Dữ liệu tách riêng theo Gmail</span>
+            <span>Xác thực qua Firebase Auth</span>
           </div>
           <div className="flex items-center gap-2">
             <Lock className="w-4 h-4 text-orange-500 shrink-0" aria-hidden="true" />
@@ -239,11 +132,6 @@ export function LoginScreen({
           </div>
         </div>
       </main>
-
-      <footer className="mt-6 text-center text-xs text-slate-400 flex items-center justify-center gap-1.5">
-        <Sparkles className="w-3.5 h-3.5 text-orange-400" aria-hidden="true" />
-        <span>Lưu trữ tức thì trên Cloudflare Workers &amp; D1</span>
-      </footer>
     </div>
   );
 }

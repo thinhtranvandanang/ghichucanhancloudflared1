@@ -13,8 +13,5 @@ export interface UserProfile {
 
 export interface AuthSessionResponse {
   authenticated: boolean;
-  mode: 'livemode' | 'testmode';
-  clientId: string;
-  loginUri: string;
   user?: UserProfile;
 }
