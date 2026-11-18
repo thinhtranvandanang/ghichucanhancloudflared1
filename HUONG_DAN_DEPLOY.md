@@ -116,10 +116,14 @@ npx wrangler dev
 ### Deploy chính thức lên Cloudflare
 
 ```bash
-npm run build
 npx wrangler deploy
 ```
 
-*(Hoặc chạy một lệnh duy nhất: `npm run deploy`)*
+*(File `wrangler.toml` đã cấu hình sẵn `[build] command = "npm run build"`, nên khi chạy `npx wrangler deploy` hoặc khi Cloudflare Workers Builds tự động deploy từ Git, thư mục `./dist` sẽ được build trước khi tải lên.)*
+
+Nếu bạn cấu hình **Workers Builds** (kết nối GitHub/GitLab trên Cloudflare Dashboard):
+- **Build command**: `npm run build` (hoặc để trống vì `wrangler.toml` đã tự chạy)
+- **Deploy command**: `npx wrangler deploy`
 
 Sau khi deploy thành công, Wrangler sẽ trả về URL dạng `https://so-tay-nhanh.<tai-khoan>.workers.dev`. Hãy nhớ quay lại Google Cloud Console kiểm tra **Authorized JavaScript origins** và **Authorized redirect URIs** đã khớp URL này chưa (kèm `/auth/callback`).
+

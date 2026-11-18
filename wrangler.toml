@@ -3,6 +3,10 @@ main = "worker/index.ts"
 compatibility_date = "2025-03-01"
 compatibility_flags = ["nodejs_compat"]
 
+# Tự động build frontend bằng Vite trước khi wrangler đọc thư mục ./dist
+[build]
+command = "npm run build"
+
 # Cấu hình phục vụ frontend đã build từ Vite qua Cloudflare Workers Static Assets
 [assets]
 directory = "./dist"
